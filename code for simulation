@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+Hybrid QKD + Classical Encryption simulation for LOS links
+with Embedded Plots (matplotlib)
+
+Plots:
+1. QKD performance (key length & QBER vs noise/loss)
+2. Packet delivery success vs retransmits
+3. Latency distribution of delivered packets
+"""
+import time, math, secrets, argparse, hashlib, hmac
+import numpy as np
+from collections import deque, namedtuple
+import matplotlib.pyplot as plt
+
+# Optional AES
+try:
+    from Crypto.Cipher import AES
+    AES_AVAILABLE = True
+except Exception:
+    AES_AVAILABLE = False
+
+# ---------- Parameters ----------
+DEFAULT_NUM_PHOTONS = 2048
+DEFAULT_P_FLIP = 0.02
+DEFAULT_P_LOSS = 0.01
+DEFAULT_PACKET_LOSS = 0.02
+DEFAULT_LATENCY_MS = 10
+KEY_BITS_PER_SESSION = 128
+KEY_POOL_TARGET = 10
+REKEY_THRESHOLD = 2
+MAX_RETRANSMITS = 3
+
+Packet = namedtuple('Packet', ['seq', 'payload', 'meta', 'auth_tag'])
+
+# ---------- Utility ----------
+def random_bits(n): return np.random.randint(0,2,size=n).astype(np.uint8)
+def bits_to_bytes(bits):
+    bits = np.array(bits).astype(np.uint8)
+    pad = (-len(bits)) % 8
+    if pad: bits = np.concatenate([bits, np.zeros(pad, dtype=np.uint8)])
+    bits = bits.reshape(-1,8)
+    vals = (bits * (2**np.arange(7,-1,-1))).sum(axis=1).astype(np.uint8)
+    return bytes(vals.tolist())
+def sha256(b): return hashlib.sha256(b).digest()
+def derive_key_from_bits(bits, out_bytes=16):
+    raw = bits_to_bytes(bits)
+    d = hashlib.sha256(raw).digest()
+    return d[:out_bytes]
+
+# ---------- Channels ----------
+class LOS_QKD_Channel:
+    def __init__(self, p_flip=DEFAULT_P_FLIP, p_loss=DEFAULT_P_LOSS):
+        self.p_flip, self.p_loss = p_flip, p_loss
+    def transmit_photons(self, alice_bits, alice_bases, bob_bases):
+        n = len(alice_bits)
+        loss_mask = np.random.rand(n) < self.p_loss
+        flips = (np.random.rand(n) < self.p_flip) & (~loss_mask)
+        bob_measure = np.zeros(n, dtype=np.uint8)
+        same_basis = (alice_bases == bob_bases) & (~loss_mask)
+        bob_measure[same_basis] = alice_bits[same_basis] ^ flips[same_basis]
+        nonmatch = (~same_basis) & (~loss_mask)
+        bob_measure[nonmatch] = random_bits(nonmatch.sum()) ^ flips[nonmatch]
+        bob_measure[loss_mask] = 2
+        return bob_measure
+
+class LOS_Classical_Channel:
+    def __init__(self, p_loss=DEFAULT_PACKET_LOSS, one_way_latency_ms=DEFAULT_LATENCY_MS):
+        self.p_loss, self.latency = p_loss, one_way_latency_ms/1000.0
+    def transmit_packet(self, packet_bytes):
+        lost = np.random.rand() < self.p_loss
+        return (not lost, self.latency if not lost else self.latency)
+
+# ---------- QKD ----------
+def run_bb84_session(num_photons=DEFAULT_NUM_PHOTONS, qkd_channel=None):
+    if qkd_channel is None: qkd_channel = LOS_QKD_Channel()
+    alice_bits, alice_bases, bob_bases = random_bits(num_photons), random_bits(num_photons), random_bits(num_photons)
+    bob_measure = qkd_channel.transmit_photons(alice_bits, alice_bases, bob_bases)
+    sift_idx = np.where((alice_bases == bob_bases) & (bob_measure != 2))[0]
+    sift_alice, sift_bob = alice_bits[sift_idx], bob_measure[sift_idx]
+    sift_len = len(sift_idx)
+    qber = (sift_alice != sift_bob).mean() if sift_len else 0.0
+    final_key = derive_key_from_bits(sift_alice, out_bytes=KEY_BITS_PER_SESSION//8)
+    return {'final_key':final_key,'qber_est':qber,'sift_len':sift_len}
+
+# ---------- Auth ----------
+def run_e91_auth(num_pairs=256, p_noise=0.01):
+    alice = random_bits(num_pairs); bob = alice.copy()
+    bob[np.random.rand(num_pairs) < p_noise] ^= 1
+    corr = (alice==bob).mean()
+    auth_key = hashlib.sha256(bits_to_bytes(alice)).digest()[:16]
+    return auth_key, corr
+
+# ---------- Key manager & Secure channel ----------
+class KeyManager:
+    def __init__(self): self.pool=deque()
+    def add_key(self,k): self.pool.append(k)
+    def get_key(self): return self.pool.popleft() if self.pool else None
+    def needs_rekeying(self): return len(self.pool)<=REKEY_THRESHOLD
+
+class SecureChannel:
+    def __init__(self, km:KeyManager):
+        self.km, self.current_key, self.use_count = km, None, 0
+    def ensure_key(self):
+        if self.current_key is None or self.use_count>=10:
+            self.current_key=self.km.get_key(); self.use_count=0
+    def encrypt(self,pt):
+        self.ensure_key()
+        if self.current_key is None: return None,{}
+        if AES_AVAILABLE:
+            nonce,secrets_token = secrets.token_bytes(12),self.current_key
+            cipher=AES.new(secrets_token,AES.MODE_GCM,nonce=nonce)
+            ct,tag=cipher.encrypt_and_digest(pt)
+            packet=nonce+tag+ct; meta={'alg':'AES'}
+        else: packet,meta=pt,{'alg':'RAW'}
+        self.use_count+=1
+        return packet,meta
+    def decrypt(self,ct,meta):
+        if self.current_key is None: return None
+        if meta['alg']=='AES':
+            nonce,tag,ct=ct[:12],ct[12:28],ct[28:]
+            cipher=AES.new(self.current_key,AES.MODE_GCM,nonce=nonce)
+            try: return cipher.decrypt_and_verify(ct,tag)
+            except: return None
+        else: return ct
+
+# ---------- Node ----------
+class Node:
+    def __init__(self,name,qkd_channel,classical_channel):
+        self.name=name; self.qkd_channel=qkd_channel; self.classical_channel=classical_channel
+        self.km=KeyManager(); self.sec=SecureChannel(self.km)
+        self.auth_key=None; self.metrics={'sent':0,'delivered':0,'lost':0}
+    def run_qkd(self,sessions=1):
+        for _ in range(sessions):
+            r=run_bb84_session(qkd_channel=self.qkd_channel)
+            self.km.add_key(r['final_key'])
+    def establish_auth(self): self.auth_key,_=run_e91_auth()
+
+# ---------- Simulation ----------
+def simulate(num_msgs=50):
+    qkd=LOS_QKD_Channel(); classical=LOS_Classical_Channel()
+    A,B=Node("A",qkd,classical),Node("B",qkd,classical)
+    A.run_qkd(5); B.run_qkd(5); A.establish_auth(); B.auth_key=A.auth_key
+    logs=[]
+    for i in range(num_msgs):
+        pt=f"Telemetry #{i}".encode()
+        pkt,meta=A.sec.encrypt(pt)
+        if pkt is None: continue
+        A.metrics['sent']+=1
+        ok,lat=classical.transmit_packet(pkt)
+        if not ok: A.metrics['lost']+=1; continue
+        pt2=B.sec.decrypt(pkt,meta)
+        if pt2: A.metrics['delivered']+=1; logs.append(lat)
+    return A.metrics,logs
+
+# ---------- Plotting ----------
+def plot_qkd_sweep():
+    flips=np.linspace(0,0.1,6); losses=np.linspace(0,0.2,5)
+    results=[]
+    for pf in flips:
+        for pl in losses:
+            qkd=LOS_QKD_Channel(p_flip=pf,p_loss=pl)
+            r=run_bb84_session(qkd_channel=qkd)
+            results.append((pf,pl,r['sift_len'],r['qber_est']))
+    results=np.array(results)
+    plt.figure(); 
+    for pl in losses:
+        subset=results[results[:,1]==pl]
+        plt.plot(subset[:,0],subset[:,2],label=f"loss={pl:.2f}")
+    plt.xlabel("Flip prob"); plt.ylabel("Sifted length"); plt.title("QKD key length vs noise"); plt.legend(); plt.show()
+    plt.figure()
+    for pl in losses:
+        subset=results[results[:,1]==pl]
+        plt.plot(subset[:,0],subset[:,3],label=f"loss={pl:.2f}")
+    plt.xlabel("Flip prob"); plt.ylabel("QBER"); plt.title("QBER vs noise"); plt.legend(); plt.show()
+
+def plot_packet_delivery(logs):
+    plt.figure()
+    bins=[0,0.005,0.01,0.015,0.02]
+    plt.hist(logs,bins=20,alpha=0.7)
+    plt.xlabel("Latency (s)"); plt.ylabel("Count"); plt.title("Latency distribution"); plt.show()
+
+# ---------- Main ----------
+if __name__=="__main__":
+    metrics,logs=simulate(100)
+    print("Metrics:",metrics)
+    plot_qkd_sweep()
+    plot_packet_delivery(logs)
